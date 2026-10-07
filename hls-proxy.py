@@ -46,6 +46,19 @@ UPSTREAM_M3U_TTL = int(os.environ.get("HLS_UPSTREAM_M3U_TTL", str(CACHE_TTL)))
 _channel_cache = {}
 # Maps upstream host -> referer (learned from /channel/ scrapes + literal mode preload)
 _referer_map = {}
+
+
+def _learn_host(url, referer):
+    """Allow-list the host of `url` (named by a playlist this proxy fetched
+    itself) and remember which Referer to send to it. Never overrides a
+    host that was configured or learned explicitly. Playlists and segments
+    are often served from different hosts/CDNs, so every host a trusted
+    playlist points at must be learned, not only the playlist's own host."""
+    if not referer:
+        return
+    m = re.match(r"https?://[^/]+", url)
+    if m:
+        _referer_map.setdefault(m.group(0), referer)
 # Per-channel declared bandwidth (bits/sec) from channels.conf field 9
 _channel_bandwidth = {}
 # Per-channel extraction mode from channels.conf field 7 ("iframe" | "direct" | "literal")
@@ -361,7 +374,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 content = resp.read()
                 resp.close()
                 if b"#EXTM3U" in content:
-                    content = self._rewrite_playlist(content, upstream_url)
+                    content = self._rewrite_playlist(content, upstream_url, referer)
                     content_type = "application/vnd.apple.mpegurl"
                 self._write_body(200, content_type, content, [
                     ("Access-Control-Allow-Origin", "*"),
@@ -532,7 +545,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 ])
                 return
 
-            content = self._rewrite_playlist(content, m3u8_url)
+            content = self._rewrite_playlist(content, m3u8_url, referer)
             if bandwidth and is_master:
                 content = self._override_master_bandwidth(content, bandwidth)
             self._write_body(200, "application/vnd.apple.mpegurl", content, [
@@ -569,10 +582,16 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
             out.append(line)
         return "\n".join(out).encode("utf-8")
 
-    def _rewrite_playlist(self, content: bytes, playlist_url: str) -> bytes:
-        """Rewrite URLs in m3u8 playlists to route through this proxy."""
+    def _rewrite_playlist(self, content: bytes, playlist_url: str, referer: str = "") -> bytes:
+        """Rewrite URLs in m3u8 playlists to route through this proxy.
+
+        Every host the playlist references (segments, keys, variant playlists)
+        is learned with the Referer the playlist itself was fetched with, so
+        segments served from a different host than the playlist still work.
+        """
         text = content.decode("utf-8", errors="replace")
         base_url = playlist_url.rsplit("/", 1)[0] + "/"
+        _learn_host(base_url, referer)
         lines = text.splitlines()
         result = []
 
@@ -582,20 +601,21 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 if "URI=" in line:
                     line = re.sub(
                         r'URI="([^"]+)"',
-                        lambda m: f'URI="{self._proxy_url(m.group(1), base_url)}"',
+                        lambda m: f'URI="{self._proxy_url(m.group(1), base_url, referer)}"',
                         line,
                     )
                 result.append(line)
             else:
-                result.append(self._proxy_url(line, base_url))
+                result.append(self._proxy_url(line, base_url, referer))
 
         return "\n".join(result).encode("utf-8")
 
-    def _proxy_url(self, url: str, base_url: str) -> str:
+    def _proxy_url(self, url: str, base_url: str, referer: str = "") -> str:
         if url.startswith("http://") or url.startswith("https://"):
             full = url
         else:
             full = base_url + url
+        _learn_host(full, referer)
         # Mirror the upstream file extension onto the proxy path. FFmpeg's HLS
         # demuxer checks the path (not the query) against allowed_segment_extensions,
         # so /proxy?url=... gets rejected while /proxy.ts?url=... is accepted.
@@ -612,7 +632,12 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
 def main():
     # Preload channels (including upstream M3U) so /playlist.m3u works on first request.
     _load_channels()
-    server = http.server.HTTPServer((BIND_ADDR, PORT), HLSProxyHandler)
+    # Threaded: players (Jellyfin/ffmpeg) open several connections at once
+    # (probe, playlist polling, parallel segment downloads). A single-threaded
+    # server lets one slow request block every other client.
+    http.server.ThreadingHTTPServer.daemon_threads = True
+    http.server.ThreadingHTTPServer.request_queue_size = 64
+    server = http.server.ThreadingHTTPServer((BIND_ADDR, PORT), HLSProxyHandler)
     print(f"[hls-proxy] Listening on {BIND_ADDR}:{PORT}")
     if ALLOWED_IPS:
         print(f"[hls-proxy] Allowed IPs: {', '.join(ALLOWED_IPS)}")
